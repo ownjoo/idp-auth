@@ -7,7 +7,7 @@ import httpx
 from fido2.server import Fido2Server
 from fido2.webauthn import PublicKeyCredentialRpEntity, PublicKeyCredentialUserEntity
 
-from idp_auth import Engine, LoginError, Recipe, RecipeError
+from idp_auth import AsyncEngine, Engine, LoginError, Recipe, RecipeError
 from idp_auth.factors.webauthn import Credential, b64url_encode
 from test.mock_idp import GenericIdp, JsonMfaIdp
 
@@ -255,6 +255,40 @@ class TestWebauthnFactor(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.outputs['status'], 'SUCCESS')
         # the caller's stored credential dict reflects the new signature counter
         self.assertEqual(stored_cred['sign_count'], 1)
+
+
+class TestAsyncDriver(unittest.IsolatedAsyncioTestCase):
+    def test_engine_alias(self):
+        self.assertIs(Engine, AsyncEngine)
+
+    def test_rejects_sync_client(self):
+        with self.assertRaises(TypeError):
+            AsyncEngine(httpx.Client())
+
+    async def test_sleep_is_awaited_with_duration(self):
+        slept = []
+
+        async def fake_sleep(seconds: float) -> None:
+            slept.append(seconds)
+
+        recipe = Recipe.from_dict({'name': 'x', 'steps': [{'sleep': 1.5}, {'sleep': '${d}'}], 'inputs': {'d': {}}})
+        async with client_for(httpx.MockTransport(lambda r: httpx.Response(200))) as client:
+            await AsyncEngine(client, sleep=fake_sleep).run(recipe, {'d': 3})
+        self.assertEqual(slept, [1.5, 3.0])
+
+    async def test_http_error_becomes_login_error_without_query(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError('refused', request=request)
+
+        recipe = Recipe.from_dict(
+            {'name': 'x', 'steps': [{'set': {'a': 1}}, {'request': {'url': 'https://down.example/p?token=abc'}}]}
+        )
+        async with client_for(httpx.MockTransport(handler)) as client:
+            with self.assertRaises(LoginError) as ctx:
+                await AsyncEngine(client).run(recipe, {})
+        self.assertEqual(ctx.exception.step, 2)
+        self.assertIn('https://down.example/p', str(ctx.exception))
+        self.assertNotIn('token=abc', str(ctx.exception))
 
 
 if __name__ == '__main__':
