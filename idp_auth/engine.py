@@ -8,7 +8,7 @@ from typing import Any
 import httpx
 
 from idp_auth.errors import LoginError
-from idp_auth.flow import DEFAULT_MAX_HOPS, Flow, HttpRequest, LoginResult, Op, Sleep
+from idp_auth.flow import DEFAULT_ERROR_TYPES, DEFAULT_MAX_HOPS, Flow, HttpRequest, LoginResult, Op, Sleep
 from idp_auth.recipe import Recipe
 
 DEFAULT_HEADERS = {
@@ -29,6 +29,7 @@ class AsyncEngine:
         sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
         max_hops: int = DEFAULT_MAX_HOPS,
         stop_at_saml: bool = False,
+        error_types: tuple[type[BaseException], ...] = DEFAULT_ERROR_TYPES,
     ):
         if not isinstance(client, httpx.AsyncClient):
             raise TypeError('AsyncEngine needs an httpx.AsyncClient; use SyncEngine with httpx.Client')
@@ -37,6 +38,7 @@ class AsyncEngine:
         self._sleep = sleep
         self._max_hops = max_hops
         self._stop_at_saml = stop_at_saml
+        self._error_types = error_types
 
     async def run(self, recipe: Recipe, inputs: dict) -> LoginResult:
         flow = Flow(
@@ -46,6 +48,7 @@ class AsyncEngine:
             clock=self._clock,
             max_hops=self._max_hops,
             stop_at_saml=self._stop_at_saml,
+            error_types=self._error_types,
         )
         ops = flow.execute()
         reply, error = None, None
@@ -60,7 +63,7 @@ class AsyncEngine:
                     reply = await self.client.request(op.method, op.url, follow_redirects=True, **op.kwargs)
                 elif isinstance(op, Sleep):
                     await self._sleep(op.seconds)
-            except httpx.HTTPError as exc:
+            except self._error_types as exc:
                 error = exc
 
 
@@ -72,6 +75,7 @@ class SyncEngine:
         sleep: Callable[[float], Any] = time.sleep,
         max_hops: int = DEFAULT_MAX_HOPS,
         stop_at_saml: bool = False,
+        error_types: tuple[type[BaseException], ...] = DEFAULT_ERROR_TYPES,
     ):
         if not isinstance(client, httpx.Client):
             raise TypeError('SyncEngine needs an httpx.Client; use AsyncEngine with httpx.AsyncClient')
@@ -80,6 +84,7 @@ class SyncEngine:
         self._sleep = sleep
         self._max_hops = max_hops
         self._stop_at_saml = stop_at_saml
+        self._error_types = error_types
 
     def run(self, recipe: Recipe, inputs: dict) -> LoginResult:
         flow = Flow(
@@ -89,6 +94,7 @@ class SyncEngine:
             clock=self._clock,
             max_hops=self._max_hops,
             stop_at_saml=self._stop_at_saml,
+            error_types=self._error_types,
         )
         ops: Generator[Op, Any, LoginResult] = flow.execute()
         reply, error = None, None
@@ -103,7 +109,7 @@ class SyncEngine:
                     reply = self.client.request(op.method, op.url, follow_redirects=True, **op.kwargs)
                 elif isinstance(op, Sleep):
                     self._sleep(op.seconds)
-            except httpx.HTTPError as exc:
+            except self._error_types as exc:
                 error = exc
 
 

@@ -1,8 +1,11 @@
 """Sans-I/O login flow: runs a Recipe, doing what a browser would between steps, without performing any I/O.
 
-``Flow.execute()`` is a generator. It yields ``HttpRequest`` / ``Sleep`` operations, receives the
-``httpx.Response`` for each request via ``send()``, and returns a ``LoginResult``. Transport errors are thrown
-back into it with ``throw()``. ``idp_auth.engine`` holds the sync and async drivers that perform the I/O.
+Driver protocol: ``Flow.execute()`` is a generator. It yields ``HttpRequest`` and ``Sleep`` operations and returns a
+``LoginResult``. For each ``HttpRequest`` the driver sends back (via ``send()``) any object with ``.text``, ``.url``,
+``.status_code``, ``.headers.get(name)`` and ``.json()``; redirects must already be followed. ``Sleep`` is resumed
+with ``None``. A failed request is reported by throwing the exception into the generator (``throw()``); exceptions of
+the types in ``error_types`` become ``LoginError(reason='transport')``. ``cookies`` only needs ``.get(name)``.
+``idp_auth.engine`` holds the httpx sync and async drivers.
 """
 
 import re
@@ -10,7 +13,7 @@ import time
 from collections.abc import Callable, Generator
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import parse_qs, urljoin, urlsplit
 
 import httpx
 
@@ -23,6 +26,7 @@ from idp_auth.template import lookup, render
 
 DEFAULT_MAX_HOPS = 10
 DEFAULT_LOOP_MAX = 10
+DEFAULT_ERROR_TYPES: tuple[type[BaseException], ...] = (httpx.HTTPError,)
 
 
 @dataclass(frozen=True)
@@ -51,11 +55,23 @@ class SamlCapture:
 @dataclass
 class LoginResult:
     outputs: dict
-    vars: dict
+    vars: dict  # recipe variables; secret inputs, and extracted values equal to one, are replaced with '***'
     saml: SamlCapture
-    response: httpx.Response | None
+    response: Any  # the last response (httpx.Response with the bundled drivers)
     page: Page | None
-    cookies: httpx.Cookies = field(repr=False, default_factory=httpx.Cookies)
+    cookies: Any = field(repr=False, default=None)  # the driver's whole jar: IdP cookies included
+
+    def cookies_for(self, host: str) -> httpx.Cookies:
+        """Only the cookies a browser would send to ``host`` (host-only matches plus parent-domain cookies)."""
+        jar = getattr(self.cookies, 'jar', None)
+        if jar is None:
+            raise TypeError('cookies_for() needs an httpx.Cookies jar')
+        host, scoped = host.lower(), httpx.Cookies()
+        for cookie in jar:
+            domain = cookie.domain.lower()
+            if host == domain.lstrip('.') or (domain.startswith('.') and host.endswith(domain)):
+                scoped.jar.set_cookie(cookie)
+        return scoped
 
 
 class _AssertionCaptured(Exception):
@@ -68,8 +84,9 @@ class _Run:
     def __init__(self, ctx: dict):
         self.ctx = ctx
         self.saml = SamlCapture()
-        self.response: httpx.Response | None = None
+        self.response: Any = None
         self.page: Page | None = None
+        self.pending_url = ''  # URL of the request in flight, for transport error messages
 
     @property
     def base_url(self) -> str:
@@ -81,13 +98,15 @@ class Flow:
         self,
         recipe: Recipe,
         inputs: dict,
-        cookies: httpx.Cookies,
+        cookies: Any = None,
         clock: Callable[[], float] = time.time,
         max_hops: int = DEFAULT_MAX_HOPS,
         stop_at_saml: bool = False,
+        error_types: tuple[type[BaseException], ...] = DEFAULT_ERROR_TYPES,
     ):
         self.recipe = recipe
         self.cookies = cookies  # the driver's client jar; read by `from: cookie` extraction
+        self._error_types = error_types
         self._ctx = recipe.bind_inputs(inputs)  # validate before any I/O
         self._clock = clock
         self._max_hops = max_hops
@@ -104,13 +123,24 @@ class Flow:
             except _AssertionCaptured:
                 break
             except LoginError as exc:
-                raise LoginError(_redact(str(exc), secrets), step=index) from None
-            except httpx.HTTPError as exc:
-                where = _safe_url(exc.request.url) if _has_request(exc) else 'unknown URL'
-                raise LoginError(f'{exc.__class__.__name__} calling {where}', step=index) from None
+                raise LoginError(
+                    _redact(str(exc), secrets),
+                    step=index,
+                    reason=exc.reason,
+                    url=exc.url or _safe_url(run.base_url) or None,
+                    status_code=exc.status_code if exc.status_code is not None else _status(run.response),
+                ) from None
+            except self._error_types as exc:
+                where = _safe_url(run.pending_url) or None
+                raise LoginError(
+                    f'{exc.__class__.__name__} calling {where or "unknown URL"}',
+                    step=index,
+                    reason='transport',
+                    url=where,
+                ) from None
         return LoginResult(
             outputs=render(recipe.outputs, ctx),
-            vars=ctx,
+            vars=_scrub(ctx, recipe.secret_inputs(), secrets),
             saml=run.saml,
             response=run.response,
             page=run.page,
@@ -160,14 +190,17 @@ class Flow:
                 )
         creds = spec.get('credentials') or {}
         form.fill_credentials(username=creds.get('username'), password=creds.get('password'))
-        submitted_password, submitted_otp = form.password_field() is not None, form.kind == 'otp'
-        if submitted_otp:
+        submitted = form.roles
+        if form.kind == 'otp':
             if spec.get('otp'):
                 form.fill_otp(str(spec['otp']))
             elif spec.get('totp_secret'):
                 form.fill_otp(Totp(spec['totp_secret'], clock=self._clock).now())
             else:
-                raise LoginError(f'{_safe_url(run.page.url)} asks for a one-time code but no totp_secret was given')
+                raise LoginError(
+                    f'{_safe_url(run.page.url)} asks for a one-time code but no totp_secret was given',
+                    reason='mfa_required',
+                )
         form.fill(spec.get('fill') or {})
 
         if not (
@@ -177,12 +210,12 @@ class Flow:
         yield from self._follow(run, step.follow)
 
         if spec.get('detect_rejection') and run.saml.response is None and run.page is not None:
+            # Asked again for (a subset of) what we just gave: rejected. Asked for something new: progress.
             again = run.page.login_form()
-            if again is not None and (
-                (submitted_password and again.password_field() is not None) or (submitted_otp and again.kind == 'otp')
-            ):
-                what = 'one-time code' if submitted_otp else 'login'
-                raise LoginError(f'{what} rejected: {run.page.error_text() or "the same form came back"}')
+            if submitted and again is not None and again.roles and again.roles <= submitted:
+                what = 'one-time code' if submitted == {'otp'} else 'login'
+                error = run.page.error_text() or 'the same form came back'
+                raise LoginError(f'{what} rejected: {error}', reason='rejected')
 
     def _do_extract(self, run: _Run, step: Step) -> None:
         self._extract(run, step.extract)
@@ -195,7 +228,10 @@ class Flow:
         yield Sleep(float(render(step.spec, run.ctx) or 0))
 
     def _do_fail(self, run: _Run, step: Step) -> None:
-        raise LoginError(str(render(step.spec, run.ctx) or 'recipe failed'))
+        spec = render(step.spec, run.ctx)
+        if isinstance(spec, dict):
+            raise LoginError(str(spec.get('message') or 'recipe failed'), reason=spec.get('reason', 'flow'))
+        raise LoginError(str(spec or 'recipe failed'))
 
     def _do_loop(self, run: _Run, step: Step) -> Ops:
         spec = step.spec
@@ -274,6 +310,7 @@ class Flow:
 
     def _send(self, run: _Run, method: str, url: str, **kwargs) -> Ops:
         kwargs = {k: v for k, v in kwargs.items() if v is not None}
+        run.pending_url = url
         response = yield HttpRequest(method, url, kwargs)
         run.response = response
         run.page = Page(response.text, str(response.url))
@@ -298,7 +335,7 @@ class Flow:
     def _extract_one(self, run: _Run, rule: dict) -> Any:
         source, response, page = rule['from'], run.response, run.page
         if source == 'cookie':
-            return self.cookies.get(rule.get('cookie') or rule['name'])
+            return self.cookies.get(rule.get('cookie') or rule['name']) if self.cookies is not None else None
         if response is None:
             return None
         if source == 'json':
@@ -325,7 +362,7 @@ class Flow:
         if source == 'header':
             return response.headers.get(rule['header'])
         if source == 'url':
-            return str(response.url)
+            return _url_param(str(response.url), rule['param']) if rule.get('param') else str(response.url)
         if source == 'status':
             return response.status_code
         return None
@@ -369,9 +406,25 @@ def _safe_url(url) -> str:
     return f'{parts.scheme}://{parts.netloc}{parts.path}' if parts.scheme else parts.path
 
 
-def _has_request(exc: httpx.HTTPError) -> bool:
-    try:
-        exc.request  # noqa: B018 - property raises when unset
-    except RuntimeError:
-        return False
-    return True
+def _status(response: Any) -> int | None:
+    return getattr(response, 'status_code', None)
+
+
+def _url_param(url: str, name: str) -> str | None:
+    """First value of a query parameter, falling back to the fragment (implicit/hybrid OAuth responses)."""
+    parts = urlsplit(url)
+    for component in (parts.query, parts.fragment):
+        values = parse_qs(component, keep_blank_values=True).get(name)
+        if values:
+            return values[0]
+    return None
+
+
+def _scrub(ctx: dict, secret_names: set[str], secrets: list[str]) -> dict:
+    scrubbed = {}
+    for key, value in ctx.items():
+        if (key in secret_names and value is not None) or (isinstance(value, str) and value in secrets):
+            scrubbed[key] = '***'
+        else:
+            scrubbed[key] = value
+    return scrubbed

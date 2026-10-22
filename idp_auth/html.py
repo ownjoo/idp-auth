@@ -32,6 +32,8 @@ _JS_ASSIGN = re.compile(
 _JS_CALL = re.compile(r'\blocation\.(?:replace|assign)\(\s*([\'"])(.*?)(?<!\\)\1\s*\)')
 _JS_ESCAPE = re.compile(r'\\(u[0-9a-fA-F]{4}|x[0-9a-fA-F]{2}|.)')
 _SUBMIT_CALL = re.compile(r'\.submit\(\s*\)')
+_LOGOUT = re.compile(r'log[-_]?out|sign[-_]?out|sign[-_]?off', re.IGNORECASE)
+_SHELL_TEXT_LIMIT = 300  # visible characters; more than this and the page is content, not a redirect shell
 
 
 @dataclass
@@ -65,6 +67,24 @@ class Form:
         if self.has_submit and all(kind in NON_VISIBLE_TYPES for kind in self.input_types.values()):
             return 'interstitial'
         return 'other'
+
+    @property
+    def roles(self) -> frozenset[str]:
+        """Which of username / password / otp this form asks a person for (hidden fields don't count)."""
+        found = {
+            role
+            for role, name in (
+                ('username', self._username_field(fallback=False)),
+                ('password', self.password_field()),
+                ('otp', self.otp_field()),
+            )
+            if name is not None
+        }
+        return frozenset(found)
+
+    @property
+    def hidden_only(self) -> bool:
+        return bool(self.input_types) and all(kind == 'hidden' for kind in self.input_types.values())
 
     def fill(self, values: dict) -> None:
         self.fields.update(values)
@@ -213,16 +233,29 @@ class Page:
         onload = (body.attributes.get('onload') or '') if body is not None else ''
         script_submits = bool(_SUBMIT_CALL.search(onload)) or any(_SUBMIT_CALL.search(s) for s in scripts)
 
-        for form in forms:
-            hidden_only = form.input_types and all(kind == 'hidden' for kind in form.input_types.values())
-            if hidden_only and (script_submits or FEDERATION_FIELDS & form.fields.keys()):
+        candidates = [f for f in forms if f.hidden_only and not _LOGOUT.search(f.action)]
+        for form in candidates:
+            if script_submits or FEDERATION_FIELDS & form.fields.keys():
                 return form.to_navigation()
 
         for meta in self._tree.css('meta'):
             if (meta.attributes.get('http-equiv') or '').lower() == 'refresh':
+                if meta.attributes.get('data-url'):  # PingFederate templates
+                    return Navigation('GET', urljoin(self.url, meta.attributes['data-url'].strip()))
                 match = _META_URL.search(meta.attributes.get('content') or '')
                 if match:
                     return Navigation('GET', urljoin(self.url, match.group(2).strip()))
+
+        # A lone hidden-only form with no button can only be submitted by script; when the script is external we
+        # can't see the submit() call, so follow it if the page is otherwise just a "please wait" shell.
+        if (
+            len(forms) == 1
+            and candidates
+            and not candidates[0].has_submit
+            and scripts
+            and len(self._visible_text()) < _SHELL_TEXT_LIMIT
+        ):
+            return candidates[0].to_navigation()
 
         if any(kind != 'hidden' for form in forms for kind in form.input_types.values()):
             return None  # an interactive page; any location= in its scripts is behind user action
@@ -247,6 +280,12 @@ class Page:
 
     def css(self, selector: str) -> list[LexborNode]:
         return self._tree.css(selector)
+
+    def _visible_text(self) -> str:
+        tree = LexborHTMLParser(self.text)
+        tree.strip_tags(['script', 'style', 'noscript', 'template'])
+        body = tree.body
+        return ' '.join(body.text(separator=' ').split()) if body is not None else ''
 
 
 def _is_submit(control: LexborNode) -> bool:
