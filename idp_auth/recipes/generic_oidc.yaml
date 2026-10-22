@@ -1,0 +1,98 @@
+name: generic_oidc
+description: >
+  OAuth 2.0 / OpenID Connect authorization-code flow with PKCE (S256), for providers whose login pages are HTML
+  forms. Endpoints come from discovery (issuer) or are given explicitly. The login pages are handled like
+  generic_saml (credentials, identifier-first, TOTP, consent, fail-fast rejection). The flow stops at redirect_uri
+  without requesting it, so redirect_uri can be a localhost address nothing listens on. query and form_post
+  response modes both work. It checks state, then exchanges the code (client_secret_post for confidential
+  clients) and returns the tokens.
+
+inputs:
+  issuer: {default: null}          # discovery at {issuer}/.well-known/openid-configuration (no trailing slash)
+  authorize_url: {default: null}   # overrides discovery
+  token_url: {default: null}       # overrides discovery
+  client_id: {}
+  client_secret: {secret: true, default: null}
+  redirect_uri: {}
+  scope: {default: openid}
+  username: {}
+  password: {secret: true}
+  totp_secret: {secret: true, default: null}
+  max_pages: {default: 10}
+
+steps:
+  - set: {authorize: "${authorize_url}", token: "${token_url}"}
+
+  - request:
+      url: ${issuer}/.well-known/openid-configuration
+      headers: {Accept: application/json}
+    follow: false
+    extract: [{name: discovery, from: json}]
+    when: {all: [{exists: "${issuer}"}, {any: [{not_exists: "${authorize}"}, {not_exists: "${token}"}]}]}
+  - set: {authorize: "${discovery.authorization_endpoint}"}
+    when: {not_exists: "${authorize}"}
+  - set: {token: "${discovery.token_endpoint}"}
+    when: {not_exists: "${token}"}
+  - fail: generic_oidc needs issuer (for discovery) or both authorize_url and token_url
+    when: {any: [{not_exists: "${authorize}"}, {not_exists: "${token}"}]}
+
+  - pkce: {into: pkce}
+  - request:
+      url: ${authorize}
+      params:
+        response_type: code
+        client_id: ${client_id}
+        redirect_uri: ${redirect_uri}
+        scope: ${scope}
+        state: ${pkce.state}
+        nonce: ${pkce.nonce}
+        code_challenge: ${pkce.challenge}
+        code_challenge_method: ${pkce.method}
+    follow: {stop_at: "${redirect_uri}"}
+
+  - loop:
+      max: ${max_pages}
+      until: {exists: "${callback.url}"}
+      message: never redirected to redirect_uri after ${max_pages} pages (an unhandled page, or a JavaScript-only login)
+      steps:
+        - submit_form:
+            credentials: {username: "${username}", password: "${password}"}
+            totp_secret: ${totp_secret}
+            detect_rejection: true
+          follow: {stop_at: "${redirect_uri}"}
+          when: {not_exists: "${callback.url}"}
+
+  - fail:
+      message: "authorization denied: ${callback.params.error}: ${callback.params.error_description}"
+      reason: rejected
+    when: {equals: ["${callback.params.error}", "access_denied"]}
+  - fail: "authorization failed: ${callback.params.error}: ${callback.params.error_description}"
+    when: {exists: "${callback.params.error}"}
+  - fail: state on the redirect does not match the one sent (stale transaction or forged response)
+    when: {not_equals: ["${callback.params.state}", "${pkce.state}"]}
+  - fail: redirect to redirect_uri carried no authorization code
+    when: {not_exists: "${callback.params.code}"}
+
+  - request:
+      method: POST
+      url: ${token}
+      headers: {Accept: application/json}
+      data:
+        grant_type: authorization_code
+        code: ${callback.params.code}
+        redirect_uri: ${redirect_uri}
+        client_id: ${client_id}
+        client_secret: ${client_secret}
+        code_verifier: ${pkce.verifier}
+    follow: false
+    extract: [{name: tokens, from: json}]
+  - fail: "token exchange failed: ${tokens.error}: ${tokens.error_description}"
+    when: {not_exists: "${tokens.access_token}"}
+
+outputs:
+  access_token: ${tokens.access_token}
+  id_token: ${tokens.id_token}
+  refresh_token: ${tokens.refresh_token}
+  token_type: ${tokens.token_type}
+  expires_in: ${tokens.expires_in}
+  scope: ${tokens.scope}

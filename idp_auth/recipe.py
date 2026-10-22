@@ -10,7 +10,7 @@ import yaml
 
 from idp_auth.errors import REASONS, RecipeError
 
-ACTIONS = {'request', 'submit_form', 'extract', 'set', 'mfa', 'sleep', 'loop', 'fail'}
+ACTIONS = {'request', 'submit_form', 'extract', 'set', 'mfa', 'sleep', 'loop', 'fail', 'pkce'}
 MODIFIERS = {'when', 'id', 'extract', 'follow', 'name'}
 EXTRACT_SOURCES = {'json', 'js_object', 'html', 'form_field', 'regex', 'header', 'cookie', 'url', 'status'}
 FACTORS = {'totp', 'webauthn'}
@@ -147,6 +147,8 @@ def _parse_step(raw, path: str) -> Step:
     elif action == 'mfa':
         if not isinstance(spec, dict) or spec.get('factor') not in FACTORS or not spec.get('into'):
             raise RecipeError(f'{path}.mfa needs factor (one of {sorted(FACTORS)}) and into')
+    elif action == 'pkce' and (not isinstance(spec, dict) or not spec.get('into')):
+        raise RecipeError(f'{path}.pkce needs into')
     elif action == 'fail' and isinstance(spec, dict):
         if not spec.get('message') or spec.get('reason', 'flow') not in REASONS:
             raise RecipeError(f'{path}.fail needs a message and a reason in {list(REASONS)}')

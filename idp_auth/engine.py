@@ -60,7 +60,7 @@ class AsyncEngine:
             reply, error = None, None
             try:
                 if isinstance(op, HttpRequest):
-                    reply = await self.client.request(op.method, op.url, follow_redirects=True, **op.kwargs)
+                    reply = await self.client.request(op.method, op.url, follow_redirects=False, **op.kwargs)
                 elif isinstance(op, Sleep):
                     await self._sleep(op.seconds)
             except self._error_types as exc:
@@ -106,7 +106,7 @@ class SyncEngine:
             reply, error = None, None
             try:
                 if isinstance(op, HttpRequest):
-                    reply = self.client.request(op.method, op.url, follow_redirects=True, **op.kwargs)
+                    reply = self.client.request(op.method, op.url, follow_redirects=False, **op.kwargs)
                 elif isinstance(op, Sleep):
                     self._sleep(op.seconds)
             except self._error_types as exc:
