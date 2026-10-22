@@ -68,7 +68,7 @@ from code that is already inside an event loop.
 | name | flow |
 |---|---|
 | `generic_saml` | SP-initiated SAML through any IdP whose login pages are HTML forms; optional TOTP |
-| `entra_saml` | SP-initiated SAML through Microsoft Entra ID (password + "Stay signed in?") |
+| `entra_saml` | SP-initiated SAML through Microsoft Entra ID (password + "Stay signed in?"); error codes stop the flow rather than re-posting, except the benign 50058 |
 
 #### `generic_saml`: start here
 
@@ -85,8 +85,13 @@ On each page it does what a person would do next:
   Shibboleth's `_eventId_proceed` relies on this.
 - **Handles MFA.** If a page asks for a one-time code, it fills a TOTP from `totp_secret`, or fails saying the
   secret is missing.
-- **Fails fast.** If the password or code form comes back, it stops with the IdP's own error message (from
-  `[role=alert]`, `.error`, `#errorText`, ...) rather than retrying.
+- **Fails fast.** If the next page asks again for what was just submitted, or for part of it, it stops with
+  `reason='rejected'` and the IdP's own error message (from `[role=alert]`, `.error`, `#errorText`, ...) rather
+  than retrying. "Part of it" covers a password page that comes back on its own. An unknown user on an
+  identifier-first page counts too. Moving from a username page to a password page is progress, not a rejection.
+- **Follows "please wait" pages.** That covers meta refresh (including PingFederate's `data-url`), JS
+  redirects, auto-posted forms, and a lone hidden-only form whose submit lives in an external script. That last
+  case is followed only when the page is otherwise near-empty and the form isn't a logout.
 
 Tested against fake IdPs shaped like Shibboleth (consent page included), ADFS (script-submitted form, then TOTP)
 and identifier-first products. IdPs whose login page is a JavaScript app (Entra, Okta, Google, ...) have no HTML
@@ -133,7 +138,69 @@ outputs:
 **Conditions**: `exists`, `not_exists`, `equals`, `not_equals`, `all`, `any`, `not`.
 
 **Extract sources**: `json` (+`path`), `js_object` (`var`, +`path`), `html` (`selector`, +`attr`), `form_field`,
-`regex`, `header`, `cookie`, `url`, `status`.
+`regex`, `header`, `cookie`, `url` (+`param`: the first value of that query parameter, falling back to the
+fragment; useful for IdPs that keep flow state in the redirect URL), `status`.
+
+**`fail`** takes a message, or `{message, reason}` where `reason` is one of `rejected`, `mfa_required` or `flow`.
+
+## Errors
+
+Every failure is a `LoginError` with these attributes:
+
+- **`reason`**:
+  - `rejected`: the IdP refused the credentials or code.
+  - `transport`: a request couldn't be sent or answered.
+  - `mfa_required`: a factor was asked for that the inputs can't satisfy.
+  - `flow`: anything else.
+- **`step`**: the 1-based index of the top-level step that failed.
+- **`url`**: the URL involved, without query string or fragment.
+- **`status_code`**: the last response's status.
+
+Branch on `reason`, not on the message. Note that HTTP 401 and 403 are not errors by themselves. A rejection shows
+up as `reason='rejected'` once the flow recognises it. The original exception is not chained, because transport
+errors carry full URLs, query-string tokens included.
+
+Secrets stay out of results:
+
+- Values of inputs marked `secret: true` are replaced with `***` in every error message and in `LoginResult.vars`.
+  So is any extracted value that equals one of them.
+- `LoginResult.cookies` is the client's whole jar, including the IdP's session cookies. Use
+  `result.cookies_for('app.example.com')` to get only the cookies a browser would send to that host.
+
+## Writing your own driver
+
+`Flow` does no I/O, so any HTTP stack can drive it. It yields `HttpRequest(method, url, kwargs)` and `Sleep(seconds)`.
+Answer each request with an object that has `.text`, `.url`, `.status_code`, `.headers.get()` and `.json()`, with
+redirects already followed. If a request fails, throw the exception in. Exceptions of the types in `error_types`
+become `LoginError(reason='transport')`. For example, with `requests`:
+
+```python
+import time
+
+import requests
+
+from idp_auth import Flow, HttpRequest, Recipe
+
+
+def run(recipe: Recipe, inputs: dict, session: requests.Session):
+    ops = Flow(recipe, inputs, cookies=session.cookies, error_types=(requests.RequestException,)).execute()
+    reply, error = None, None
+    while True:
+        try:
+            op = ops.throw(error) if error else ops.send(reply)
+        except StopIteration as done:
+            return done.value
+        reply, error = None, None
+        try:
+            if isinstance(op, HttpRequest):
+                reply = session.request(op.method, op.url, allow_redirects=True, **op.kwargs)
+            else:
+                time.sleep(op.seconds)
+        except requests.RequestException as exc:
+            error = exc
+```
+
+`op.kwargs` holds `params`, `data`, `json` and `headers`, which `requests` accepts as they are.
 
 ## Development
 

@@ -8,7 +8,7 @@ from typing import Any
 
 import yaml
 
-from idp_auth.errors import RecipeError
+from idp_auth.errors import REASONS, RecipeError
 
 ACTIONS = {'request', 'submit_form', 'extract', 'set', 'mfa', 'sleep', 'loop', 'fail'}
 MODIFIERS = {'when', 'id', 'extract', 'follow', 'name'}
@@ -147,6 +147,9 @@ def _parse_step(raw, path: str) -> Step:
     elif action == 'mfa':
         if not isinstance(spec, dict) or spec.get('factor') not in FACTORS or not spec.get('into'):
             raise RecipeError(f'{path}.mfa needs factor (one of {sorted(FACTORS)}) and into')
+    elif action == 'fail' and isinstance(spec, dict):
+        if not spec.get('message') or spec.get('reason', 'flow') not in REASONS:
+            raise RecipeError(f'{path}.fail needs a message and a reason in {list(REASONS)}')
     elif action in ('request', 'set', 'submit_form') and spec is not None and not isinstance(spec, dict):
         raise RecipeError(f'{path}.{action} must be a mapping')
     return step

@@ -90,10 +90,22 @@ class GenericIdp:
 
 
 class EntraLikeIdp:
-    """Mimics Entra ID's $Config-driven login: credentials page, then 'Stay signed in?' (KMSI), then SAML POST."""
+    """Mimics Entra ID's $Config-driven login: credentials page, then 'Stay signed in?' (KMSI), then SAML POST.
 
-    def __init__(self, username='svc@example.com', password='pw'):
+    Like real Entra, the first page carries sErrorCode 50058 (silent sign-in found no session) by default.
+    """
+
+    def __init__(
+        self,
+        username='svc@example.com',
+        password='pw',
+        first_page_error: str | None = '50058',
+        error_page_has_url_post: bool = False,
+    ):
         self.username, self.password = username, password
+        self.first_page_error = first_page_error
+        self.error_page_has_url_post = error_page_has_url_post
+        self.password_posts = 0
         self.sp = ServiceProvider('https://login.example.com/saml2')
 
     @staticmethod
@@ -105,24 +117,29 @@ class EntraLikeIdp:
             return sp
         path = request.url.path
         if path == '/saml2':
-            return self.config_page(
-                {
-                    'urlPost': '/common/login',
-                    'sFT': 'ft-1',
-                    'sFTName': 'flowToken',
-                    'sCtx': 'ctx-1',
-                    'canary': 'can-1',
-                    'sCanaryTokenName': 'canary',
-                    'sessionId': 'sess-1',
-                }
-            )
+            first = {
+                'urlPost': '/common/login',
+                'sFT': 'ft-1',
+                'sFTName': 'flowToken',
+                'sCtx': 'ctx-1',
+                'canary': 'can-1',
+                'sCanaryTokenName': 'canary',
+                'sessionId': 'sess-1',
+            }
+            if self.first_page_error:
+                first['sErrorCode'] = self.first_page_error
+            return self.config_page(first)
         if path == '/common/login':
             data = form(request)
             expected = {'flowToken': 'ft-1', 'ctx': 'ctx-1', 'canary': 'can-1', 'loginfmt': self.username}
             if any(data.get(k) != v for k, v in expected.items()):
                 return httpx.Response(400, text='bad flow')
+            self.password_posts += 1
             if data.get('passwd') != self.password:
-                return self.config_page({'sErrorCode': '50126', 'sFT': 'ft-err', 'sFTName': 'flowToken'})
+                error = {'sErrorCode': '50126', 'sFT': 'ft-1', 'sFTName': 'flowToken', 'sCtx': 'ctx-1'}
+                if self.error_page_has_url_post:
+                    error.update({'urlPost': '/common/login', 'canary': 'can-1', 'sCanaryTokenName': 'canary'})
+                return self.config_page(error)
             return self.config_page({'urlPost': '/kmsi', 'sFT': 'ft-2', 'sFTName': 'flowToken', 'sCtx': 'ctx-2'})
         if path == '/kmsi':
             data = form(request)

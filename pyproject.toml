@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "oj-idp-auth"
 version = "0.1.0"
-description = "Browserless IdP login (SAML, OIDC, vendor flows) over httpx, driven by declarative recipes"
+description = "Browserless IdP login (SAML, vendor flows, TOTP/WebAuthn) over httpx, driven by declarative recipes"
 readme = "README.md"
 license = "MIT"
 authors = [

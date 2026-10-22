@@ -22,9 +22,13 @@ steps:
       steps:
         - extract:
             - {name: config, from: js_object, var: $Config}
-        - fail: Entra sign-in error ${config.sErrorCode}
-          when: {exists: "${config.sErrorCode}"}
-        - fail: unrecognised Entra page at ${config.urlPost}
+        # 50058 (silent sign-in found no session) rides along on an ordinary first page; anything else stops us,
+        # even when the page offers a urlPost to retry, so a bad password is never re-posted.
+        - fail: {message: "Entra requires MFA for this account (error ${config.sErrorCode})", reason: mfa_required}
+          when: {any: [{equals: ["${config.sErrorCode}", "50076"]}, {equals: ["${config.sErrorCode}", "50079"]}]}
+        - fail: {message: "Entra sign-in error ${config.sErrorCode}", reason: rejected}
+          when: {all: [{exists: "${config.sErrorCode}"}, {not_equals: ["${config.sErrorCode}", "50058"]}]}
+        - fail: unrecognised Entra page (its $Config has no urlPost)
           when: {not_exists: "${config.urlPost}"}
         - request:
             method: POST
