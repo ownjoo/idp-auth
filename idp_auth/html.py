@@ -12,7 +12,17 @@ USERNAME_NAMES = {
     'username', 'user_name', 'user', 'login', 'loginfmt', 'email', 'identifier', 'userid', 'user_id', 'uid',
     'j_username', 'pf.username', 'usernameuserinput', 'ctl00$contentplaceholder1$usernametextbox',
 }  # fmt: skip
+OTP_NAMES = {
+    'otp', 'totp', 'code', 'passcode', 'otpcode', 'mfacode', 'verificationcode', 'onetimecode', 'securitycode',
+    'authcode', 'tokencode', 'jotp',
+}  # fmt: skip
 UNSUBMITTED_TYPES = {'submit', 'button', 'image', 'reset', 'file'}
+SUBMIT_TYPES = {'submit', 'image'}
+NON_VISIBLE_TYPES = {'hidden', 'checkbox', 'radio'}
+ERROR_SELECTORS = (
+    '[role=alert]', '#errorText', '#error-text', '.error', '.errors', '.error-message', '.errorText', '.output--error',
+    '.alert-danger', '.alert-error', '.kc-feedback-text', '.form-error', '.ping-error', '.text-danger',
+)  # fmt: skip
 FEDERATION_FIELDS = {'SAMLResponse', 'SAMLRequest', 'wresult', 'wa'}
 
 _META_URL = re.compile(r'url\s*=\s*([\'"]?)(.+?)\1\s*$', re.IGNORECASE)
@@ -39,32 +49,72 @@ class Form:
     action: str
     fields: dict
     input_types: dict  # name -> lowercased input type, in document order
+    autocomplete: dict = field(default_factory=dict)  # name -> lowercased autocomplete attribute
+    submitter: tuple[str, str] | None = None  # default button's (name, value), sent when a user submits
+    has_submit: bool = False
+
+    @property
+    def kind(self) -> str:
+        """'credentials', 'otp', 'interstitial' (nothing to fill, just a button) or 'other'."""
+        if self.password_field() is not None:
+            return 'credentials'
+        if self.otp_field() is not None:
+            return 'otp'
+        if self._username_field(fallback=False) is not None:
+            return 'credentials'
+        if self.has_submit and all(kind in NON_VISIBLE_TYPES for kind in self.input_types.values()):
+            return 'interstitial'
+        return 'other'
 
     def fill(self, values: dict) -> None:
         self.fields.update(values)
 
     def fill_credentials(self, username: str | None = None, password: str | None = None) -> None:
-        if password is not None:
-            for name, kind in self.input_types.items():
-                if kind == 'password':
-                    self.fields[name] = password
-                    break
+        if password is not None and (name := self.password_field()):
+            self.fields[name] = password
         if username is not None and (name := self._username_field()):
             self.fields[name] = username
 
-    def _username_field(self) -> str | None:
+    def fill_otp(self, code: str) -> bool:
+        name = self.otp_field()
+        if name is None:
+            return False
+        self.fields[name] = code
+        return True
+
+    def password_field(self) -> str | None:
+        otp = self.otp_field()
+        return next((n for n, k in self.input_types.items() if k == 'password' and n != otp), None)
+
+    def otp_field(self) -> str | None:
         for name, kind in self.input_types.items():
-            if name.lower() in USERNAME_NAMES or kind == 'email':
+            if kind not in ('text', 'tel', 'number', 'password'):
+                continue
+            if self.autocomplete.get(name) == 'one-time-code' or re.sub(r'[\W_]', '', name.lower()) in OTP_NAMES:
                 return name
-        for name, kind in self.input_types.items():
+        return None
+
+    def _username_field(self, fallback: bool = True) -> str | None:
+        otp = self.otp_field()
+        candidates = [(n, k) for n, k in self.input_types.items() if k not in NON_VISIBLE_TYPES and n != otp]
+        for name, kind in candidates:
+            if name.lower() in USERNAME_NAMES or kind == 'email' or self.autocomplete.get(name) == 'username':
+                return name
+        if not fallback:
+            return None
+        for name, kind in candidates:
             if kind == 'password':
                 break
             if kind == 'text':
                 return name
         return None
 
-    def to_navigation(self) -> Navigation:
-        return Navigation(self.method, self.action, dict(self.fields))
+    def to_navigation(self, submitter: bool = False) -> Navigation:
+        """``submitter=True`` mimics a person pressing the default button; script ``form.submit()`` omits it."""
+        data = dict(self.fields)
+        if submitter and self.submitter is not None:
+            data[self.submitter[0]] = self.submitter[1]
+        return Navigation(self.method, self.action, data)
 
 
 class Page:
@@ -83,6 +133,24 @@ class Page:
             node = None
         return self._form(node) if node is not None else None
 
+    def login_form(self) -> Form | None:
+        """The form a person would fill next: credentials, then a one-time code, then a bare continue/consent."""
+        forms = self.forms()
+        for kind in ('credentials', 'otp', 'interstitial'):
+            for form in forms:
+                if form.kind == kind:
+                    return form
+        return None
+
+    def error_text(self) -> str | None:
+        """Visible error message in a conventional container, truncated to 200 characters."""
+        for selector in ERROR_SELECTORS:
+            for node in self._tree.css(selector):
+                text = ' '.join(node.text(separator=' ').split())
+                if text:
+                    return text[:200]
+        return None
+
     def form_field(self, name: str) -> str | None:
         for form in self.forms():
             if name in form.fields:
@@ -90,11 +158,19 @@ class Page:
         return None
 
     def _form(self, node: LexborNode) -> Form:
-        fields, types = {}, {}
-        for control in node.css('input, select, textarea'):
+        fields, types, autocomplete = {}, {}, {}
+        submitter, has_submit = None, False
+        for control in node.css('input, select, textarea, button'):
             attrs = control.attributes
             name = attrs.get('name')
-            if not name or 'disabled' in attrs:
+            if 'disabled' in attrs:
+                continue
+            if _is_submit(control):
+                if not has_submit and name:
+                    submitter = (name, attrs.get('value') or '')
+                has_submit = True
+                continue
+            if not name or control.tag == 'button':
                 continue
             if control.tag == 'select':
                 options = control.css('option')
@@ -110,6 +186,8 @@ class Page:
             if kind in UNSUBMITTED_TYPES:
                 continue
             types[name] = kind
+            if attrs.get('autocomplete'):
+                autocomplete[name] = attrs['autocomplete'].lower()
             if kind in ('checkbox', 'radio'):
                 if 'checked' in attrs:
                     fields[name] = attrs.get('value') or 'on'
@@ -121,6 +199,9 @@ class Page:
             action=urljoin(self.url, attrs.get('action') or self.url),
             fields=fields,
             input_types=types,
+            autocomplete=autocomplete,
+            submitter=submitter,
+            has_submit=has_submit,
         )
 
     # -- navigation --------------------------------------------------------------------------------------------
@@ -166,6 +247,13 @@ class Page:
 
     def css(self, selector: str) -> list[LexborNode]:
         return self._tree.css(selector)
+
+
+def _is_submit(control: LexborNode) -> bool:
+    kind = (control.attributes.get('type') or '').lower()
+    if control.tag == 'button':
+        return kind in ('', 'submit')  # a <button> without a type is a submit button
+    return control.tag == 'input' and kind in SUBMIT_TYPES
 
 
 def _unescape_js(text: str) -> str:

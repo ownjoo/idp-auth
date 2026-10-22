@@ -9,7 +9,7 @@ from idp_auth.factors.totp import Totp
 
 
 def form(request: httpx.Request) -> dict:
-    return dict(parse_qsl(request.content.decode()))
+    return dict(parse_qsl(request.content.decode(), keep_blank_values=True))
 
 
 def html(body: str, status: int = 200, **kwargs) -> httpx.Response:

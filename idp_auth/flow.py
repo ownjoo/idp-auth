@@ -147,15 +147,42 @@ class Flow:
         spec = render(step.spec or {}, run.ctx)
         if run.page is None:
             raise LoginError('submit_form with no page loaded')
-        form = run.page.form(spec.get('selector'))
-        if form is None:
-            raise LoginError(f'no form matching {spec.get("selector") or "form"} on {_safe_url(run.page.url)}')
-        form.fill(spec.get('fill') or {})
+        if spec.get('selector'):
+            form = run.page.form(spec['selector'])
+            if form is None:
+                raise LoginError(f'no form matching {spec["selector"]} on {_safe_url(run.page.url)}')
+        else:
+            form = run.page.login_form()
+            if form is None:
+                raise LoginError(
+                    f'no login form on {_safe_url(run.page.url)} (if the page is built by JavaScript, '
+                    'this IdP needs a vendor recipe)'
+                )
         creds = spec.get('credentials') or {}
         form.fill_credentials(username=creds.get('username'), password=creds.get('password'))
-        if not (yield from self._navigate(run, form.to_navigation(), self._follow_options(run, step.follow))):
+        submitted_password, submitted_otp = form.password_field() is not None, form.kind == 'otp'
+        if submitted_otp:
+            if spec.get('otp'):
+                form.fill_otp(str(spec['otp']))
+            elif spec.get('totp_secret'):
+                form.fill_otp(Totp(spec['totp_secret'], clock=self._clock).now())
+            else:
+                raise LoginError(f'{_safe_url(run.page.url)} asks for a one-time code but no totp_secret was given')
+        form.fill(spec.get('fill') or {})
+
+        if not (
+            yield from self._navigate(run, form.to_navigation(submitter=True), self._follow_options(run, step.follow))
+        ):
             return
         yield from self._follow(run, step.follow)
+
+        if spec.get('detect_rejection') and run.saml.response is None and run.page is not None:
+            again = run.page.login_form()
+            if again is not None and (
+                (submitted_password and again.password_field() is not None) or (submitted_otp and again.kind == 'otp')
+            ):
+                what = 'one-time code' if submitted_otp else 'login'
+                raise LoginError(f'{what} rejected: {run.page.error_text() or "the same form came back"}')
 
     def _do_extract(self, run: _Run, step: Step) -> None:
         self._extract(run, step.extract)

@@ -1,15 +1,19 @@
 name: generic_saml
 description: >
-  SP-initiated SAML against an IdP with a plain HTML username/password form. Follows redirects, auto-submitted
-  forms, meta refresh and JS location hops; fills the first form's username/password fields; captures the
-  SAMLResponse and (by default) delivers it to the SP so the client ends up holding the SP session.
+  SP-initiated SAML against any IdP that renders its login pages as HTML forms (Shibboleth, ADFS forms login,
+  Keycloak, PingFederate templates, SimpleSAMLphp, CAS, ...). On each page it picks the form a person would use
+  next: credentials (including identifier-first username/password pages), a one-time code (filled from
+  totp_secret), or a bare continue/consent page. It follows redirects, auto-submitted forms, meta refresh and
+  JS location hops, and stops with the IdP's own error message if a password or code is rejected. The captured
+  SAMLResponse is delivered to the SP by default, so the client ends up holding the SP session.
 
 inputs:
   start_url: {}
   username: {}
   password: {secret: true}
+  totp_secret: {secret: true, default: null}
   deliver_assertion: {default: true}
-  max_attempts: {default: 3}
+  max_pages: {default: 10}
 
 steps:
   - request:
@@ -17,12 +21,14 @@ steps:
     follow: {deliver_saml: "${deliver_assertion}"}
 
   - loop:
-      max: ${max_attempts}
+      max: ${max_pages}
       until: {exists: "${saml.response}"}
-      message: no SAMLResponse after submitting the login form ${max_attempts} times (wrong credentials, MFA, or a JS-only IdP)
+      message: no SAMLResponse after ${max_pages} pages (an unhandled page, or a JavaScript-only IdP)
       steps:
         - submit_form:
             credentials: {username: "${username}", password: "${password}"}
+            totp_secret: ${totp_secret}
+            detect_rejection: true
           follow: {deliver_saml: "${deliver_assertion}"}
           when: {not_exists: "${saml.response}"}
 
