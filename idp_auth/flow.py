@@ -58,6 +58,10 @@ class LoginResult:
     cookies: httpx.Cookies = field(repr=False, default_factory=httpx.Cookies)
 
 
+class _AssertionCaptured(Exception):
+    """Unwinds the step stack when stop_at_saml is set and an assertion has been captured."""
+
+
 class _Run:
     """Mutable state of one recipe execution."""
 
@@ -80,12 +84,14 @@ class Flow:
         cookies: httpx.Cookies,
         clock: Callable[[], float] = time.time,
         max_hops: int = DEFAULT_MAX_HOPS,
+        stop_at_saml: bool = False,
     ):
         self.recipe = recipe
         self.cookies = cookies  # the driver's client jar; read by `from: cookie` extraction
         self._ctx = recipe.bind_inputs(inputs)  # validate before any I/O
         self._clock = clock
         self._max_hops = max_hops
+        self._stop_at_saml = stop_at_saml  # end the flow at the first SAMLResponse, never delivering it
 
     def execute(self) -> Generator[Op, Any, LoginResult]:
         ctx, recipe = self._ctx, self.recipe
@@ -95,6 +101,8 @@ class Flow:
         for index, step in enumerate(recipe.steps, start=1):
             try:
                 yield from self._step(run, step)
+            except _AssertionCaptured:
+                break
             except LoginError as exc:
                 raise LoginError(_redact(str(exc), secrets), step=index) from None
             except httpx.HTTPError as exc:
@@ -246,9 +254,10 @@ class Flow:
             form = next(f for f in run.page.forms() if 'SAMLResponse' in f.fields)
             self._capture_saml(run, assertion, form.fields.get('RelayState'), form.action)
 
-    @staticmethod
-    def _capture_saml(run: _Run, response: str | None, relay_state: str | None, acs_url: str) -> None:
+    def _capture_saml(self, run: _Run, response: str | None, relay_state: str | None, acs_url: str) -> None:
         run.saml.response, run.saml.relay_state, run.saml.acs_url = response, relay_state, acs_url
+        if self._stop_at_saml and response:
+            raise _AssertionCaptured
 
     # -- extraction and conditions -----------------------------------------------------------------------------
 

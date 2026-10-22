@@ -7,6 +7,7 @@ from typing import Any
 
 import httpx
 
+from idp_auth.errors import LoginError
 from idp_auth.flow import DEFAULT_MAX_HOPS, Flow, HttpRequest, LoginResult, Op, Sleep
 from idp_auth.recipe import Recipe
 
@@ -27,6 +28,7 @@ class AsyncEngine:
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
         max_hops: int = DEFAULT_MAX_HOPS,
+        stop_at_saml: bool = False,
     ):
         if not isinstance(client, httpx.AsyncClient):
             raise TypeError('AsyncEngine needs an httpx.AsyncClient; use SyncEngine with httpx.Client')
@@ -34,9 +36,17 @@ class AsyncEngine:
         self._clock = clock
         self._sleep = sleep
         self._max_hops = max_hops
+        self._stop_at_saml = stop_at_saml
 
     async def run(self, recipe: Recipe, inputs: dict) -> LoginResult:
-        flow = Flow(recipe, inputs, cookies=self.client.cookies, clock=self._clock, max_hops=self._max_hops)
+        flow = Flow(
+            recipe,
+            inputs,
+            cookies=self.client.cookies,
+            clock=self._clock,
+            max_hops=self._max_hops,
+            stop_at_saml=self._stop_at_saml,
+        )
         ops = flow.execute()
         reply, error = None, None
         while True:
@@ -61,6 +71,7 @@ class SyncEngine:
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], Any] = time.sleep,
         max_hops: int = DEFAULT_MAX_HOPS,
+        stop_at_saml: bool = False,
     ):
         if not isinstance(client, httpx.Client):
             raise TypeError('SyncEngine needs an httpx.Client; use AsyncEngine with httpx.AsyncClient')
@@ -68,9 +79,17 @@ class SyncEngine:
         self._clock = clock
         self._sleep = sleep
         self._max_hops = max_hops
+        self._stop_at_saml = stop_at_saml
 
     def run(self, recipe: Recipe, inputs: dict) -> LoginResult:
-        flow = Flow(recipe, inputs, cookies=self.client.cookies, clock=self._clock, max_hops=self._max_hops)
+        flow = Flow(
+            recipe,
+            inputs,
+            cookies=self.client.cookies,
+            clock=self._clock,
+            max_hops=self._max_hops,
+            stop_at_saml=self._stop_at_saml,
+        )
         ops: Generator[Op, Any, LoginResult] = flow.execute()
         reply, error = None, None
         while True:
@@ -125,3 +144,31 @@ def login_sync(
         return SyncEngine(client, **engine_kwargs).run(recipe, inputs)
     with httpx.Client(headers=DEFAULT_HEADERS, follow_redirects=True, timeout=DEFAULT_TIMEOUT) as own:
         return SyncEngine(own, **engine_kwargs).run(recipe, inputs)
+
+
+async def saml_response(
+    recipe: str | Recipe | dict,
+    inputs: dict,
+    client: httpx.AsyncClient | None = None,
+    **engine_kwargs,
+) -> str:
+    """Run the flow only until a SAMLResponse appears and return it, undelivered. Raises LoginError if none does."""
+    result = await login(recipe, inputs, client=client, stop_at_saml=True, **engine_kwargs)
+    return _assertion(result)
+
+
+def saml_response_sync(
+    recipe: str | Recipe | dict,
+    inputs: dict,
+    client: httpx.Client | None = None,
+    **engine_kwargs,
+) -> str:
+    """Blocking counterpart of ``saml_response()``."""
+    result = login_sync(recipe, inputs, client=client, stop_at_saml=True, **engine_kwargs)
+    return _assertion(result)
+
+
+def _assertion(result: LoginResult) -> str:
+    if not result.saml.response:
+        raise LoginError('flow finished without producing a SAMLResponse')
+    return result.saml.response

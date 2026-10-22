@@ -38,6 +38,23 @@ proxies, HTTP/2, a custom transport and so on. Without one, a client with browse
 (`idp_auth.DEFAULT_HEADERS`). For more control, use `AsyncEngine(client).run(recipe, inputs)` or
 `SyncEngine(client).run(...)`. Both accept `clock`, `sleep` and `max_hops`.
 
+### Stopping at the assertion
+
+Sometimes you want the assertion itself, to exchange with AWS STS or hand to another service, and not an SP
+session. `saml_response()` / `saml_response_sync()` run the flow only until a `SAMLResponse` form field appears,
+never post it to the SP, and return its value. They raise `LoginError` if the flow ends without one.
+
+```python
+from idp_auth import saml_response, saml_response_sync
+
+assertion = await saml_response('entra_saml', inputs)
+assertion = saml_response_sync('entra_saml', inputs)
+```
+
+This works with any recipe, whatever its own delivery settings. It also works when the assertion sits in a form
+that a browser wouldn't submit automatically. For the full `LoginResult` (RelayState, ACS URL, cookies), pass
+`stop_at_saml=True` to `login()`, `login_sync()`, `AsyncEngine` or `SyncEngine`.
+
 ### How it's built
 
 The flow logic (`idp_auth.flow.Flow`) is sans-I/O. It is a generator that yields `HttpRequest` and `Sleep`
