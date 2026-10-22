@@ -10,7 +10,7 @@ import yaml
 
 from idp_auth.errors import REASONS, RecipeError
 
-ACTIONS = {'request', 'submit_form', 'extract', 'set', 'mfa', 'sleep', 'loop', 'fail', 'pkce'}
+ACTIONS = {'request', 'submit_form', 'extract', 'set', 'mfa', 'sleep', 'loop', 'fail', 'pkce', 'client_assertion'}
 MODIFIERS = {'when', 'id', 'extract', 'follow', 'name'}
 EXTRACT_SOURCES = {'json', 'js_object', 'html', 'form_field', 'regex', 'header', 'cookie', 'url', 'status'}
 FACTORS = {'totp', 'webauthn'}
@@ -147,6 +147,17 @@ def _parse_step(raw, path: str) -> Step:
     elif action == 'mfa':
         if not isinstance(spec, dict) or spec.get('factor') not in FACTORS or not spec.get('into'):
             raise RecipeError(f'{path}.mfa needs factor (one of {sorted(FACTORS)}) and into')
+    elif action == 'client_assertion' and (
+        not isinstance(spec, dict) or not all(spec.get(k) for k in ('into', 'client_id', 'audience', 'private_key'))
+    ):
+        raise RecipeError(f'{path}.client_assertion needs into, client_id, audience and private_key')
+    elif (
+        action == 'request'
+        and isinstance(spec, dict)
+        and 'basic_auth' in spec
+        and not isinstance(spec['basic_auth'], dict)
+    ):
+        raise RecipeError(f'{path}.request.basic_auth must be a mapping with username and password')
     elif action == 'pkce' and (not isinstance(spec, dict) or not spec.get('into')):
         raise RecipeError(f'{path}.pkce needs into')
     elif action == 'fail' and isinstance(spec, dict):

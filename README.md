@@ -70,6 +70,7 @@ from code that is already inside an event loop.
 | `generic_saml` | SP-initiated SAML through any IdP whose login pages are HTML forms; optional TOTP |
 | `entra_saml` | SP-initiated SAML through Microsoft Entra ID (password + "Stay signed in?"); error codes stop the flow rather than re-posting, except the benign 50058 |
 | `generic_oidc` | OAuth 2.0 / OIDC authorization code + PKCE through an HTML-form login; returns tokens |
+| `client_credentials` | OAuth 2.0 client credentials (service accounts): client secret or signed JWT, no login page |
 
 #### `generic_oidc`
 
@@ -126,6 +127,43 @@ and identifier-first products. IdPs whose login page is a JavaScript app (Entra,
 form to work with. The recipe stops with "no login form", and those IdPs need a vendor recipe such as
 `entra_saml`.
 
+#### `client_credentials`: service accounts
+
+For machine access, this is the route the vendors support and the one to prefer. There's no login page and no
+interactive MFA, just a client authenticating to the token endpoint.
+
+```python
+result = await login(
+    'client_credentials',
+    {
+        'token_url': 'https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token',  # or issuer= for discovery
+        'client_id': '<app id>',
+        'private_key': open('svc.key').read(),
+        'certificate': open('svc.crt').read(),  # Entra matches the cert by the x5t thumbprints
+        'scope': 'https://graph.microsoft.com/.default',
+    },
+)
+result.outputs['access_token']
+```
+
+Client authentication, picked by `auth_method` or from what you pass:
+
+- `private_key_jwt`, the default when `private_key` is given. It sends a signed assertion: RS256 for RSA keys,
+  ES256 for P-256 keys. iss and sub are the client id, aud is the token endpoint, and each run gets a fresh `jti`
+  with a 5-minute lifetime. `certificate` adds `x5t` / `x5t#S256` to the header, and `key_id` adds `kid`.
+- `client_secret_post`, the default when only `client_secret` is given.
+- `client_secret_basic`. Both parts are form-urlencoded before base64, per RFC 6749.
+
+`scope`, `audience` and `resource` are passed through when set. `invalid_client` and `unauthorized_client`
+errors come back as `reason='rejected'`. Typical setups:
+
+| IdP | what to register | notes |
+|---|---|---|
+| Entra ID | app registration with a certificate (or secret) | `scope: <resource>/.default`; pass `certificate` for `x5t` |
+| Okta | API Services app, public key / private key auth | `token_url: https://<org>/oauth2/<server>/v1/token`; `key_id` if the JWKS has several keys |
+| Auth0 | Machine-to-Machine app | `audience: <API identifier>` |
+| Keycloak | confidential client with service accounts enabled | `issuer: https://<host>/realms/<realm>` |
+
 ## Recipe format
 
 ```yaml
@@ -149,9 +187,14 @@ outputs:
   session_token: ${authn.sessionToken}
 ```
 
-**Actions** (one per step): `request`, `submit_form`, `extract`, `set`, `mfa`, `sleep`, `loop`, `fail`, `pkce`.
-`pkce: {into: p}` sets `p.verifier`, `p.challenge`, `p.method` (`S256`), `p.state` and `p.nonce`, all freshly
-random.
+**Actions** (one per step): `request`, `submit_form`, `extract`, `set`, `mfa`, `sleep`, `loop`, `fail`, `pkce`,
+`client_assertion`.
+
+- `pkce: {into: p}` sets `p.verifier`, `p.challenge`, `p.method` (`S256`), `p.state` and `p.nonce`, all freshly
+  random.
+- `client_assertion: {into, client_id, audience, private_key, key_id?, certificate?, lifetime?}` sets a signed
+  JWT for `private_key_jwt`.
+- `request` also takes `basic_auth: {username, password}`. It's skipped when either part renders to null.
 
 **Step modifiers**:
 

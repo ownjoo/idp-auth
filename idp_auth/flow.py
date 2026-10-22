@@ -26,6 +26,7 @@ from idp_auth.errors import LoginError
 from idp_auth.factors.totp import Totp
 from idp_auth.factors.webauthn import Credential
 from idp_auth.html import Navigation, Page
+from idp_auth.oauth import basic_auth_header, client_assertion
 from idp_auth.recipe import Recipe, Step
 from idp_auth.template import lookup, render
 
@@ -169,6 +170,10 @@ class Flow:
         spec = render(step.spec or {}, run.ctx)
         if not spec.get('url'):
             raise LoginError('request step rendered without a url')
+        headers = spec.get('headers')
+        basic = spec.get('basic_auth') or {}
+        if basic.get('username') is not None and basic.get('password') is not None:
+            headers = {**(headers or {}), 'Authorization': basic_auth_header(basic['username'], basic['password'])}
         delivered = yield from self._send(
             run,
             spec.get('method', 'GET').upper(),
@@ -177,7 +182,7 @@ class Flow:
             params=spec.get('params'),
             data=spec.get('data'),
             json=spec.get('json'),
-            headers=spec.get('headers'),
+            headers=headers,
         )
         if delivered:
             yield from self._follow(run, step.follow)
@@ -232,6 +237,23 @@ class Flow:
     def _do_set(self, run: _Run, step: Step) -> None:
         for key, value in (step.spec or {}).items():
             run.ctx[key] = render(value, run.ctx)
+
+    def _do_client_assertion(self, run: _Run, step: Step) -> None:
+        spec = render(step.spec, run.ctx)
+        if not (spec.get('client_id') and spec.get('audience') and spec.get('private_key')):
+            raise LoginError('client_assertion rendered without client_id, audience or private_key')
+        try:
+            run.ctx[spec['into']] = client_assertion(
+                spec['client_id'],
+                spec['audience'],
+                spec['private_key'],
+                key_id=spec.get('key_id'),
+                certificate=spec.get('certificate'),
+                lifetime=int(spec.get('lifetime', 300)),
+                clock=self._clock,
+            )
+        except ValueError as exc:
+            raise LoginError(f'client_assertion: {exc}') from None
 
     def _do_pkce(self, run: _Run, step: Step) -> None:
         verifier = _b64url(secrets.token_bytes(32))
