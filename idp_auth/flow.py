@@ -70,12 +70,17 @@ class LoginResult:
     cookies: Any = field(repr=False, default=None)  # the driver's whole jar: IdP cookies included
 
     def cookies_for(self, host: str) -> httpx.Cookies:
-        """Only the cookies a browser would send to ``host`` (host-only matches plus parent-domain cookies)."""
-        jar = getattr(self.cookies, 'jar', None)
-        if jar is None:
-            raise TypeError('cookies_for() needs an httpx.Cookies jar')
+        """Only the cookies a browser would send to ``host`` (host-only matches plus parent-domain cookies).
+
+        Works with httpx.Cookies and with a plain ``http.cookiejar.CookieJar`` (e.g. a ``requests`` session's jar).
+        """
+        jar = getattr(self.cookies, 'jar', self.cookies)  # httpx wraps a jar in .jar; a stdlib jar is iterable
+        try:
+            cookies = iter(jar)
+        except TypeError:
+            raise TypeError('cookies_for() needs an httpx.Cookies or http.cookiejar.CookieJar') from None
         host, scoped = host.lower(), httpx.Cookies()
-        for cookie in jar:
+        for cookie in cookies:
             domain = cookie.domain.lower()
             if host == domain.lstrip('.') or (domain.startswith('.') and host.endswith(domain)):
                 scoped.jar.set_cookie(cookie)
@@ -95,6 +100,7 @@ class _Run:
         self.response: Any = None
         self.page: Page | None = None
         self.pending_url = ''  # URL of the request in flight, for transport error messages
+        self.secrets: list[str] = []  # secret values (inputs + ones derived at run time) to redact
 
     @property
     def base_url(self) -> str:
@@ -122,8 +128,8 @@ class Flow:
 
     def execute(self) -> Generator[Op, Any, LoginResult]:
         ctx, recipe = self._ctx, self.recipe
-        secrets = [v for k, v in ctx.items() if k in recipe.secret_inputs() and isinstance(v, str) and v]
         run = _Run(ctx)
+        run.secrets = [v for k, v in ctx.items() if k in recipe.secret_inputs() and isinstance(v, str) and v]
         ctx['saml'] = run.saml
         for index, step in enumerate(recipe.steps, start=1):
             try:
@@ -132,7 +138,7 @@ class Flow:
                 break
             except LoginError as exc:
                 raise LoginError(
-                    _redact(str(exc), secrets),
+                    _redact(str(exc), run.secrets),
                     step=index,
                     reason=exc.reason,
                     url=exc.url or _safe_url(run.base_url) or None,
@@ -148,7 +154,7 @@ class Flow:
                 ) from None
         return LoginResult(
             outputs=render(recipe.outputs, ctx),
-            vars=_scrub(ctx, recipe.secret_inputs(), secrets),
+            vars=_scrub(ctx, recipe.secret_inputs(), run.secrets),
             saml=run.saml,
             response=run.response,
             page=run.page,
@@ -243,7 +249,7 @@ class Flow:
         if not (spec.get('client_id') and spec.get('audience') and spec.get('private_key')):
             raise LoginError('client_assertion rendered without client_id, audience or private_key')
         try:
-            run.ctx[spec['into']] = client_assertion(
+            assertion = client_assertion(
                 spec['client_id'],
                 spec['audience'],
                 spec['private_key'],
@@ -254,6 +260,8 @@ class Flow:
             )
         except ValueError as exc:
             raise LoginError(f'client_assertion: {exc}') from None
+        run.ctx[spec['into']] = assertion
+        run.secrets.append(assertion)  # a bearer credential: redact from vars and errors
 
     def _do_pkce(self, run: _Run, step: Step) -> None:
         verifier = _b64url(secrets.token_bytes(32))
@@ -264,6 +272,7 @@ class Flow:
             'state': _b64url(secrets.token_bytes(16)),
             'nonce': _b64url(secrets.token_bytes(16)),
         }
+        run.secrets.append(verifier)  # the proof-key secret: redact from vars and errors
 
     def _do_sleep(self, run: _Run, step: Step) -> Ops:
         yield Sleep(float(render(step.spec, run.ctx) or 0))
@@ -364,12 +373,19 @@ class Flow:
             location = response.headers.get('location')
             if response.status_code not in REDIRECT_STATUSES or not location:
                 break
-            url = urljoin(str(response.url), location)
+            target = urljoin(str(response.url), location)
             if response.status_code == 303 or (response.status_code in (301, 302) and method == 'POST'):
                 method = 'GET'
                 kwargs = {k: v for k, v in kwargs.items() if k == 'headers'}
             else:
                 kwargs = {k: v for k, v in kwargs.items() if k != 'params'}  # Location is the complete URL
+            if not _same_origin(url, target):
+                # A cross-origin redirect must not carry an explicit Authorization/Cookie header to the new host.
+                stripped = _without_credentials(kwargs.get('headers'))
+                kwargs = (
+                    {**kwargs, 'headers': stripped} if stripped else {k: v for k, v in kwargs.items() if k != 'headers'}
+                )
+            url = target
         else:
             raise LoginError(f'more than {MAX_REDIRECTS} redirects starting at {_safe_url(run.pending_url)}')
         run.response = response
@@ -496,6 +512,18 @@ def _callback_params(url: str, kwargs: dict) -> dict:
     return params
 
 
+_CREDENTIAL_HEADERS = {'authorization', 'proxy-authorization', 'cookie'}
+
+
+def _same_origin(a: str, b: str) -> bool:
+    pa, pb = urlsplit(str(a)), urlsplit(str(b))
+    return (pa.scheme.lower(), pa.hostname, pa.port) == (pb.scheme.lower(), pb.hostname, pb.port)
+
+
+def _without_credentials(headers: dict | None) -> dict:
+    return {k: v for k, v in (headers or {}).items() if k.lower() not in _CREDENTIAL_HEADERS}
+
+
 def _status(response: Any) -> int | None:
     return getattr(response, 'status_code', None)
 
@@ -510,11 +538,21 @@ def _url_param(url: str, name: str) -> str | None:
     return None
 
 
-def _scrub(ctx: dict, secret_names: set[str], secrets: list[str]) -> dict:
-    scrubbed = {}
-    for key, value in ctx.items():
-        if (key in secret_names and value is not None) or (isinstance(value, str) and value in secrets):
-            scrubbed[key] = '***'
-        else:
-            scrubbed[key] = value
-    return scrubbed
+def _scrub(ctx: dict, secret_names: set[str], secrets: list[str], _top: bool = True) -> Any:
+    """Redact secret values anywhere in ``ctx`` (and, at the top level, values of secret-named inputs).
+
+    Recurses into dicts and lists so derived secrets nested in structures (e.g. a PKCE verifier) are caught.
+    """
+    if isinstance(ctx, dict):
+        out = {}
+        for key, value in ctx.items():
+            if _top and key in secret_names and value is not None:
+                out[key] = '***'
+            else:
+                out[key] = _scrub(value, secret_names, secrets, _top=False)
+        return out
+    if isinstance(ctx, list):
+        return [_scrub(v, secret_names, secrets, _top=False) for v in ctx]
+    if isinstance(ctx, str) and ctx in secrets:
+        return '***'
+    return ctx

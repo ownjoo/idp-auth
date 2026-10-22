@@ -201,7 +201,8 @@ outputs:
 - `when`: a condition.
 - `extract`: rules run after the action.
 - `follow`: `true` (the default), `false`, or `{deliver_saml: false, max_hops: 10, stop_at: <url>}`.
-  - HTTP redirects are always followed, up to 20.
+  - HTTP redirects are always followed, up to 20. A redirect to a different origin drops any explicit
+    `Authorization`, `Proxy-Authorization` and `Cookie` header you set (the cookie jar is unaffected).
   - `follow` controls page-level navigation: forms, meta refresh and scripts.
   - `stop_at` ends navigation before any request to that URL (scheme, host and path compared) and sets
     `callback.url` plus `callback.params`. The params merge the query, the fragment and any form fields.
