@@ -19,21 +19,32 @@ MFA uses a built-in software authenticator. Enrol the service account with it an
 
 ## Usage
 
-```python
-import asyncio
-from idp_auth import login
+Sync and async are both native. Neither one wraps the other.
 
-result = asyncio.run(login('entra_saml', {
-    'start_url': 'https://app.example.com/sso/start',
-    'username': 'svc-etl@example.com',
-    'password': '...',
-}))
-result.saml.response    # base64 SAMLResponse
-result.cookies          # SP session cookies (the assertion is delivered to the ACS by default)
+```python
+from idp_auth import login, login_sync
+
+inputs = {'start_url': 'https://app.example.com/sso/start', 'username': 'svc-etl@example.com', 'password': '...'}
+
+result = await login('entra_saml', inputs)  # httpx.AsyncClient
+result = login_sync('entra_saml', inputs)  # httpx.Client
+
+result.saml.response  # base64 SAMLResponse
+result.cookies  # SP session cookies (the assertion is delivered to the ACS by default)
 ```
 
-Pass `client=` to use your own `httpx.AsyncClient`, for proxies, HTTP/2, a custom transport and so on. Without
-one, `login()` creates a client with browser-like headers (`idp_auth.DEFAULT_HEADERS`).
+Pass `client=` to use your own client (`httpx.AsyncClient` for `login`, `httpx.Client` for `login_sync`), for
+proxies, HTTP/2, a custom transport and so on. Without one, a client with browser-like headers is created
+(`idp_auth.DEFAULT_HEADERS`). For more control, use `AsyncEngine(client).run(recipe, inputs)` or
+`SyncEngine(client).run(...)`. Both accept `clock`, `sleep` and `max_hops`.
+
+### How it's built
+
+The flow logic (`idp_auth.flow.Flow`) is sans-I/O. It is a generator that yields `HttpRequest` and `Sleep`
+operations and receives responses back. `SyncEngine` and `AsyncEngine` are ~20-line drivers that perform those
+operations with `httpx.Client` / `time.sleep` or `httpx.AsyncClient` / `asyncio.sleep`. Recipes, HTML handling and
+factors are shared, so the two modes cannot drift apart. `login_sync` never touches asyncio, so it is safe to call
+from code that is already inside an event loop.
 
 ### Bundled recipes
 
