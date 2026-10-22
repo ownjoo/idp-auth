@@ -1,0 +1,32 @@
+name: generic_saml
+description: >
+  SP-initiated SAML against an IdP with a plain HTML username/password form. Follows redirects, auto-submitted
+  forms, meta refresh and JS location hops; fills the first form's username/password fields; captures the
+  SAMLResponse and (by default) delivers it to the SP so the client ends up holding the SP session.
+
+inputs:
+  start_url: {}
+  username: {}
+  password: {secret: true}
+  deliver_assertion: {default: true}
+  max_attempts: {default: 3}
+
+steps:
+  - request:
+      url: ${start_url}
+    follow: {deliver_saml: "${deliver_assertion}"}
+
+  - loop:
+      max: ${max_attempts}
+      until: {exists: "${saml.response}"}
+      message: no SAMLResponse after submitting the login form ${max_attempts} times (wrong credentials, MFA, or a JS-only IdP)
+      steps:
+        - submit_form:
+            credentials: {username: "${username}", password: "${password}"}
+          follow: {deliver_saml: "${deliver_assertion}"}
+          when: {not_exists: "${saml.response}"}
+
+outputs:
+  saml_response: ${saml.response}
+  relay_state: ${saml.relay_state}
+  acs_url: ${saml.acs_url}
