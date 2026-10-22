@@ -67,8 +67,31 @@ from code that is already inside an event loop.
 
 | name | flow |
 |---|---|
-| `generic_saml` | SP-initiated SAML, plain HTML username/password form |
+| `generic_saml` | SP-initiated SAML through any IdP whose login pages are HTML forms; optional TOTP |
 | `entra_saml` | SP-initiated SAML through Microsoft Entra ID (password + "Stay signed in?") |
+
+#### `generic_saml`: start here
+
+Inputs: `start_url`, `username`, `password`. Optional: `totp_secret`, `deliver_assertion` (default true) and
+`max_pages` (default 10).
+
+On each page it does what a person would do next:
+
+- **Picks the right form.** It skips search boxes and language pickers and uses the credentials form. If there
+  isn't one, it uses a one-time-code form, then a bare continue/consent page.
+- **Fills by role.** It finds the username, password and OTP fields by type, `autocomplete` and common names.
+  Identifier-first flows (username on one page, password on the next) work.
+- **Clicks the default button.** The first submit button's name and value are sent, as a browser does.
+  Shibboleth's `_eventId_proceed` relies on this.
+- **Handles MFA.** If a page asks for a one-time code, it fills a TOTP from `totp_secret`, or fails saying the
+  secret is missing.
+- **Fails fast.** If the password or code form comes back, it stops with the IdP's own error message (from
+  `[role=alert]`, `.error`, `#errorText`, ...) rather than retrying.
+
+Tested against fake IdPs shaped like Shibboleth (consent page included), ADFS (script-submitted form, then TOTP)
+and identifier-first products. IdPs whose login page is a JavaScript app (Entra, Okta, Google, ...) have no HTML
+form to work with. The recipe stops with "no login form", and those IdPs need a vendor recipe such as
+`entra_saml`.
 
 ## Recipe format
 
