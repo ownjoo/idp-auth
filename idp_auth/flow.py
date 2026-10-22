@@ -2,18 +2,23 @@
 
 Driver protocol: ``Flow.execute()`` is a generator. It yields ``HttpRequest`` and ``Sleep`` operations and returns a
 ``LoginResult``. For each ``HttpRequest`` the driver sends back (via ``send()``) any object with ``.text``, ``.url``,
-``.status_code``, ``.headers.get(name)`` and ``.json()``; redirects must already be followed. ``Sleep`` is resumed
-with ``None``. A failed request is reported by throwing the exception into the generator (``throw()``); exceptions of
-the types in ``error_types`` become ``LoginError(reason='transport')``. ``cookies`` only needs ``.get(name)``.
+``.status_code``, ``.headers.get(name)`` and ``.json()``. Drivers must NOT follow redirects: the flow follows
+them itself, one ``HttpRequest`` per hop, so it can stop before a URL (e.g. an OAuth ``redirect_uri``).
+``Sleep`` is resumed with ``None``. A failed request is reported by throwing the exception into the generator
+(``throw()``); exceptions of the types in ``error_types`` become ``LoginError(reason='transport')``. ``cookies``
+only needs ``.get(name)``.
 ``idp_auth.engine`` holds the httpx sync and async drivers.
 """
 
+import base64
+import hashlib
 import re
+import secrets
 import time
 from collections.abc import Callable, Generator
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import parse_qs, urljoin, urlsplit
+from urllib.parse import parse_qs, parse_qsl, urlencode, urljoin, urlsplit
 
 import httpx
 
@@ -27,6 +32,8 @@ from idp_auth.template import lookup, render
 DEFAULT_MAX_HOPS = 10
 DEFAULT_LOOP_MAX = 10
 DEFAULT_ERROR_TYPES: tuple[type[BaseException], ...] = (httpx.HTTPError,)
+MAX_REDIRECTS = 20
+REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 
 
 @dataclass(frozen=True)
@@ -162,16 +169,18 @@ class Flow:
         spec = render(step.spec or {}, run.ctx)
         if not spec.get('url'):
             raise LoginError('request step rendered without a url')
-        yield from self._send(
+        delivered = yield from self._send(
             run,
-            method=spec.get('method', 'GET').upper(),
-            url=urljoin(run.base_url, spec['url']),
+            spec.get('method', 'GET').upper(),
+            urljoin(run.base_url, spec['url']),
+            self._follow_options(run, step.follow),
             params=spec.get('params'),
             data=spec.get('data'),
             json=spec.get('json'),
             headers=spec.get('headers'),
         )
-        yield from self._follow(run, step.follow)
+        if delivered:
+            yield from self._follow(run, step.follow)
 
     def _do_submit_form(self, run: _Run, step: Step) -> Ops:
         spec = render(step.spec or {}, run.ctx)
@@ -223,6 +232,16 @@ class Flow:
     def _do_set(self, run: _Run, step: Step) -> None:
         for key, value in (step.spec or {}).items():
             run.ctx[key] = render(value, run.ctx)
+
+    def _do_pkce(self, run: _Run, step: Step) -> None:
+        verifier = _b64url(secrets.token_bytes(32))
+        run.ctx[step.spec['into']] = {
+            'verifier': verifier,
+            'challenge': _b64url(hashlib.sha256(verifier.encode()).digest()),
+            'method': 'S256',
+            'state': _b64url(secrets.token_bytes(16)),
+            'nonce': _b64url(secrets.token_bytes(16)),
+        }
 
     def _do_sleep(self, run: _Run, step: Step) -> Ops:
         yield Sleep(float(render(step.spec, run.ctx) or 0))
@@ -284,6 +303,7 @@ class Flow:
         return {
             'deliver_saml': opts.get('deliver_saml', True) not in (False, 'false', 'False', 0),
             'max_hops': int(opts.get('max_hops', self._max_hops)),
+            'stop_at': opts.get('stop_at') or None,
         }
 
     def _follow(self, run: _Run, follow) -> Ops:
@@ -297,26 +317,45 @@ class Flow:
         raise LoginError(f'page auto-navigation did not settle after {opts["max_hops"]} hops')
 
     def _navigate(self, run: _Run, nav: Navigation, opts: dict | None) -> Generator[Op, Any, bool]:
-        """Send a page-initiated request. Returns False when it was withheld (undelivered SAML assertion)."""
+        """Send a page-initiated request. False when withheld (undelivered SAML assertion, or a stop_at URL)."""
         if 'SAMLResponse' in nav.data:
             self._capture_saml(run, nav.data.get('SAMLResponse'), nav.data.get('RelayState'), nav.url)
             if opts is not None and not opts['deliver_saml']:
                 return False
         if nav.method == 'GET':
-            yield from self._send(run, 'GET', nav.url, params=nav.data or None)
-        else:
-            yield from self._send(run, nav.method, nav.url, data=nav.data)
-        return True
+            return (yield from self._send(run, 'GET', nav.url, opts, params=nav.data or None))
+        return (yield from self._send(run, nav.method, nav.url, opts, data=nav.data))
 
-    def _send(self, run: _Run, method: str, url: str, **kwargs) -> Ops:
+    def _send(self, run: _Run, method: str, url: str, opts: dict | None, **kwargs) -> Generator[Op, Any, bool]:
+        """One request plus its redirect chain. False when it stopped at ``stop_at`` instead of fetching it."""
         kwargs = {k: v for k, v in kwargs.items() if v is not None}
-        run.pending_url = url
-        response = yield HttpRequest(method, url, kwargs)
+        stop_at = opts.get('stop_at') if opts else None
+        for _ in range(MAX_REDIRECTS + 1):
+            if stop_at and _same_endpoint(url, stop_at):
+                run.ctx['callback'] = {
+                    'url': _with_params(url, kwargs.get('params')),
+                    'params': _callback_params(url, kwargs),
+                }
+                return False
+            run.pending_url = url
+            response = yield HttpRequest(method, url, kwargs)
+            location = response.headers.get('location')
+            if response.status_code not in REDIRECT_STATUSES or not location:
+                break
+            url = urljoin(str(response.url), location)
+            if response.status_code == 303 or (response.status_code in (301, 302) and method == 'POST'):
+                method = 'GET'
+                kwargs = {k: v for k, v in kwargs.items() if k == 'headers'}
+            else:
+                kwargs = {k: v for k, v in kwargs.items() if k != 'params'}  # Location is the complete URL
+        else:
+            raise LoginError(f'more than {MAX_REDIRECTS} redirects starting at {_safe_url(run.pending_url)}')
         run.response = response
         run.page = Page(response.text, str(response.url))
         if (assertion := run.page.form_field('SAMLResponse')) and run.saml.response is None:
             form = next(f for f in run.page.forms() if 'SAMLResponse' in f.fields)
             self._capture_saml(run, assertion, form.fields.get('RelayState'), form.action)
+        return True
 
     def _capture_saml(self, run: _Run, response: str | None, relay_state: str | None, acs_url: str) -> None:
         run.saml.response, run.saml.relay_state, run.saml.acs_url = response, relay_state, acs_url
@@ -404,6 +443,35 @@ def _safe_url(url) -> str:
     """URL without query or fragment, which tend to carry tokens."""
     parts = urlsplit(str(url))
     return f'{parts.scheme}://{parts.netloc}{parts.path}' if parts.scheme else parts.path
+
+
+def _b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b'=').decode()
+
+
+def _same_endpoint(url: str, target: str) -> bool:
+    """Same scheme, host, port and path; query and fragment ignored."""
+    a, b = urlsplit(url), urlsplit(target)
+    return (a.scheme.lower(), a.netloc.lower(), a.path or '/') == (b.scheme.lower(), b.netloc.lower(), b.path or '/')
+
+
+def _with_params(url: str, params: dict | None) -> str:
+    if not params:
+        return url
+    return f'{url}{"&" if "?" in url else "?"}{urlencode(params)}'
+
+
+def _callback_params(url: str, kwargs: dict) -> dict:
+    """What the redirect target would have received: query, fragment, then GET params or POSTed form fields."""
+    parts = urlsplit(url)
+    params: dict = {}
+    for component in (parts.query, parts.fragment):
+        for key, value in parse_qsl(component, keep_blank_values=True):
+            params.setdefault(key, value)
+    for source in (kwargs.get('params'), kwargs.get('data')):
+        if isinstance(source, dict):
+            params.update(source)
+    return params
 
 
 def _status(response: Any) -> int | None:

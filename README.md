@@ -69,6 +69,34 @@ from code that is already inside an event loop.
 |---|---|
 | `generic_saml` | SP-initiated SAML through any IdP whose login pages are HTML forms; optional TOTP |
 | `entra_saml` | SP-initiated SAML through Microsoft Entra ID (password + "Stay signed in?"); error codes stop the flow rather than re-posting, except the benign 50058 |
+| `generic_oidc` | OAuth 2.0 / OIDC authorization code + PKCE through an HTML-form login; returns tokens |
+
+#### `generic_oidc`
+
+```python
+result = await login(
+    'generic_oidc',
+    {
+        'issuer': 'https://login.example.com',  # discovery; or pass authorize_url + token_url
+        'client_id': 'my-app',
+        'redirect_uri': 'http://localhost:8765/callback',
+        'username': 'svc',
+        'password': '...',
+    },
+)
+result.outputs['access_token'], result.outputs['id_token'], result.outputs['refresh_token']
+```
+
+Optional inputs: `client_secret` (confidential clients, sent as `client_secret_post`), `scope` (default
+`openid`), `totp_secret` and `max_pages`.
+
+- The login pages are handled exactly as in `generic_saml`.
+- The flow stops at `redirect_uri` without requesting it, so nothing needs to listen there. Both a redirect and a
+  `form_post` response work.
+- It checks `state`, reports OAuth errors (`access_denied` as `reason='rejected'`), then exchanges the code with
+  the PKCE verifier.
+- An existing IdP session that redirects straight back works too.
+- It does **not** validate the ID token signature. The token is returned for your OIDC library to verify.
 
 #### `generic_saml`: start here
 
@@ -121,13 +149,19 @@ outputs:
   session_token: ${authn.sessionToken}
 ```
 
-**Actions** (one per step): `request`, `submit_form`, `extract`, `set`, `mfa`, `sleep`, `loop`, `fail`.
+**Actions** (one per step): `request`, `submit_form`, `extract`, `set`, `mfa`, `sleep`, `loop`, `fail`, `pkce`.
+`pkce: {into: p}` sets `p.verifier`, `p.challenge`, `p.method` (`S256`), `p.state` and `p.nonce`, all freshly
+random.
 
 **Step modifiers**:
 
 - `when`: a condition.
 - `extract`: rules run after the action.
-- `follow`: `true` (the default), `false`, or `{deliver_saml: false, max_hops: 10}`.
+- `follow`: `true` (the default), `false`, or `{deliver_saml: false, max_hops: 10, stop_at: <url>}`.
+  - HTTP redirects are always followed, up to 20.
+  - `follow` controls page-level navigation: forms, meta refresh and scripts.
+  - `stop_at` ends navigation before any request to that URL (scheme, host and path compared) and sets
+    `callback.url` plus `callback.params`. The params merge the query, the fragment and any form fields.
 
 **Templates**: `${dotted.path}` over inputs, extracted variables and `saml.*`.
 
@@ -170,8 +204,10 @@ Secrets stay out of results:
 ## Writing your own driver
 
 `Flow` does no I/O, so any HTTP stack can drive it. It yields `HttpRequest(method, url, kwargs)` and `Sleep(seconds)`.
-Answer each request with an object that has `.text`, `.url`, `.status_code`, `.headers.get()` and `.json()`, with
-redirects already followed. If a request fails, throw the exception in. Exceptions of the types in `error_types`
+Answer each request with an object that has `.text`, `.url`, `.status_code`, `.headers.get()` and `.json()`.
+**Don't follow redirects.** The flow follows each hop itself, so that it can stop before a URL such as an OAuth
+`redirect_uri`. Cookies set on intermediate redirects must still land in the jar, which `requests` and httpx both
+do. If a request fails, throw the exception in. Exceptions of the types in `error_types`
 become `LoginError(reason='transport')`. For example, with `requests`:
 
 ```python
@@ -193,7 +229,7 @@ def run(recipe: Recipe, inputs: dict, session: requests.Session):
         reply, error = None, None
         try:
             if isinstance(op, HttpRequest):
-                reply = session.request(op.method, op.url, allow_redirects=True, **op.kwargs)
+                reply = session.request(op.method, op.url, allow_redirects=False, **op.kwargs)
             else:
                 time.sleep(op.seconds)
         except requests.RequestException as exc:
