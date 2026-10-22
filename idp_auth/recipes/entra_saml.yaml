@@ -1,0 +1,46 @@
+name: entra_saml
+description: >
+  SP-initiated SAML through Microsoft Entra ID with username/password. Each Entra page embeds a $Config JSON blob
+  carrying the next POST URL, flow token and canary; the loop keeps posting until Entra hands back a SAMLResponse
+  (the "Stay signed in?" page is answered with LoginOptions=1).
+
+inputs:
+  start_url: {}
+  username: {}
+  password: {secret: true}
+  deliver_assertion: {default: true}
+
+steps:
+  - request:
+      url: ${start_url}
+    follow: {deliver_saml: "${deliver_assertion}"}
+
+  - loop:
+      max: 6
+      until: {exists: "${saml.response}"}
+      message: Entra did not return a SAMLResponse (MFA or an unhandled interstitial page)
+      steps:
+        - extract:
+            - {name: config, from: js_object, var: $Config}
+        - fail: Entra sign-in error ${config.sErrorCode}
+          when: {exists: "${config.sErrorCode}"}
+        - fail: unrecognised Entra page at ${config.urlPost}
+          when: {not_exists: "${config.urlPost}"}
+        - request:
+            method: POST
+            url: ${config.urlPost}
+            data:
+              login: ${username}
+              loginfmt: ${username}
+              passwd: ${password}
+              ctx: ${config.sCtx}
+              hpgrequestid: ${config.sessionId}
+              ${config.sFTName}: ${config.sFT}
+              ${config.sCanaryTokenName}: ${config.canary}
+              LoginOptions: "1"
+          follow: {deliver_saml: "${deliver_assertion}"}
+
+outputs:
+  saml_response: ${saml.response}
+  relay_state: ${saml.relay_state}
+  acs_url: ${saml.acs_url}
