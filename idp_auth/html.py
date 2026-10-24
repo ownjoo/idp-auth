@@ -141,6 +141,7 @@ class Page:
     def __init__(self, text: str, url: str):
         self.text, self.url = text, url
         self._tree = LexborHTMLParser(text)
+        self._visible: str | None = None  # memoised; computed only if auto_navigation needs it
 
     # -- forms -------------------------------------------------------------------------------------------------
 
@@ -233,7 +234,7 @@ class Page:
         onload = (body.attributes.get('onload') or '') if body is not None else ''
         script_submits = bool(_SUBMIT_CALL.search(onload)) or any(_SUBMIT_CALL.search(s) for s in scripts)
 
-        candidates = [f for f in forms if f.hidden_only and not _LOGOUT.search(f.action)]
+        candidates = [f for f in forms if f.hidden_only and not _is_logout(f)]
         for form in candidates:
             if script_submits or FEDERATION_FIELDS & form.fields.keys():
                 return form.to_navigation()
@@ -282,10 +283,17 @@ class Page:
         return self._tree.css(selector)
 
     def _visible_text(self) -> str:
-        tree = LexborHTMLParser(self.text)
-        tree.strip_tags(['script', 'style', 'noscript', 'template'])
-        body = tree.body
-        return ' '.join(body.text(separator=' ').split()) if body is not None else ''
+        if self._visible is None:
+            tree = LexborHTMLParser(self.text)
+            tree.strip_tags(['script', 'style', 'noscript', 'template'])
+            body = tree.body
+            self._visible = ' '.join(body.text(separator=' ').split()) if body is not None else ''
+        return self._visible
+
+
+def _is_logout(form: 'Form') -> bool:
+    """A form is a sign-out if its action says so or a field carries a WS-Federation signout (wa=wsignout...)."""
+    return bool(_LOGOUT.search(form.action)) or any(_LOGOUT.search(str(v)) for v in form.fields.values())
 
 
 def _is_submit(control: LexborNode) -> bool:

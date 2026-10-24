@@ -176,10 +176,17 @@ class TestDriverProtocolRedirects(unittest.TestCase):
 
 class TestPkceAction(unittest.IsolatedAsyncioTestCase):
     async def test_values(self):
-        recipe = Recipe.from_dict({'name': 'x', 'steps': [{'pkce': {'into': 'p'}}]})
+        # verifier is a secret, so it is scrubbed from .vars; read the values through outputs instead
+        recipe = Recipe.from_dict(
+            {
+                'name': 'x',
+                'steps': [{'pkce': {'into': 'p'}}],
+                'outputs': {k: f'${{p.{k}}}' for k in ('verifier', 'challenge', 'method', 'state', 'nonce')},
+            }
+        )
         async with client(lambda r: httpx.Response(200)) as c:
-            first = (await AsyncEngine(c).run(recipe, {})).vars['p']
-            second = (await AsyncEngine(c).run(recipe, {})).vars['p']
+            first = (await AsyncEngine(c).run(recipe, {})).outputs
+            second = (await AsyncEngine(c).run(recipe, {})).outputs
         self.assertEqual(len(first['verifier']), 43)
         digest = base64.urlsafe_b64encode(hashlib.sha256(first['verifier'].encode()).digest()).rstrip(b'=').decode()
         self.assertEqual(first['challenge'], digest)
